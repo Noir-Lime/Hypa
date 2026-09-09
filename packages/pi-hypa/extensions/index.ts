@@ -4,6 +4,7 @@ import { resolveHypaBinary, rewriteCommand } from "./rewrite-client.js";
 import { registerHypaMcpProxyBridge } from "./mcp-proxy-bridge.js";
 import { registerHypaTools } from "./tools.js";
 import type { HypaDiagnostics, RewriteStatus } from "./types.js";
+import { compressBashOutput } from "./bash-output.js";
 
 // Pi --tools allowlists both builtins and extension tools, so a session may have
 // bash/read without hypa_* (subagent/explore). Strip a builtin only when its pair is active.
@@ -55,6 +56,16 @@ export default function (pi: ExtensionAPI) {
 
   registerHypaTools(hypaPi, effectiveConfig);
   registerHypaMcpProxyBridge(hypaPi, effectiveConfig);
+  const compressCalls = new Set<string>();
+  pi.on("agent_end", () => { compressCalls.clear(); });
+  pi.on("session_shutdown", () => { compressCalls.clear(); });
+  pi.on("tool_result", async (event) => {
+    if (event.toolName !== "bash" || !compressCalls.delete(event.toolCallId) || event.isError) return;
+    // Preserve native truncation notices, artifact paths, and non-text results.
+    if (event.content.length !== 1 || event.content[0].type !== "text" || event.details?.truncation) return;
+    const text = await compressBashOutput(pi, effectiveConfig, event.content[0].text);
+    if (text !== undefined) return { content: [{ type: "text", text }] };
+  });
 
   if (config.mode === "replace") {
     pi.on("before_agent_start", () => {
@@ -74,7 +85,7 @@ export default function (pi: ExtensionAPI) {
 
     switch (status.kind) {
       case "rewritten":
-        event.input.command = status.command;
+        compressCalls.add(event.toolCallId);
         return;
       case "passthrough":
       case "skipped":
@@ -86,12 +97,12 @@ export default function (pi: ExtensionAPI) {
         if (ctx.hasUI) {
           const ok = await ctx.ui.confirm("Hypa confirmation", status.reason);
           if (!ok) return { block: true, reason: "Blocked by user after Hypa confirmation request." };
-          event.input.command = status.command;
+          compressCalls.add(event.toolCallId);
           return;
         }
 
         if (config.askNonInteractive === "allow") {
-          event.input.command = status.command;
+          compressCalls.add(event.toolCallId);
           return;
         }
 
@@ -110,6 +121,7 @@ export default function (pi: ExtensionAPI) {
       const lines = [
         "Hypa Pi extension",
         `Mode: ${diagnostics.mode}`,
+        "Bash execution: native Pi; Hypa compresses results only",
         `Config file: ${diagnostics.configFilePath ?? "none"}`,
         `Binary: ${diagnostics.binary}`,
         `Resolved binary: ${diagnostics.resolvedBinary}`,
